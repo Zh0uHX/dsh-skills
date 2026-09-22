@@ -1,0 +1,7 @@
+node_modules/
+.agents/skills/
+work/
+test-results/
+playwright-report/
+.DS_Store
+*.tsbuildinfo
