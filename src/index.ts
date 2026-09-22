@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
+import type {} from '@deepseek-ai/dsh-fs';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import z from '@deepseek-ai/schemastery';
 import { SkillsShSource } from './catalog.js';
@@ -9,7 +10,7 @@ import { SkillStore } from './store.js';
 import { SkillError, type CatalogSkill } from './types.js';
 
 export const name = 'dsh-skills';
-export const inject = ['webServer', 'connection'];
+export const inject = ['webServer', 'connection', 'fs'];
 export interface Config { dshHome?: string }
 export const Config: z<Config> = z.object({ dshHome: z.string() });
 const ROUTE = '/api/dsh-skills';
@@ -77,6 +78,15 @@ function idOf(body: Record<string, unknown>): string {
   return body.id;
 }
 
+/** Directory swaps can be coalesced by file watchers; publish the committed entrypoint state. */
+export async function publishSkillObservation(ctx: Context, directory: string): Promise<void> {
+  const target = await ctx.fs.resolve(join(directory, 'SKILL.md'));
+  const info = await ctx.fs.stat(target);
+  ctx.emit('fs/observed', target, info ? { kind: 'present', version: info.version } : { kind: 'absent' }, {
+    name: 'write', source: 'dsh-skills',
+  });
+}
+
 /** The default root is the same user-dsh root scanned by dsh-skill-filesystem. */
 export function apply(ctx: Context, config: Config = {}): void {
   const root = join(resolveDshHome(config.dshHome), 'skills');
@@ -114,10 +124,27 @@ export function apply(ctx: Context, config: Config = {}): void {
         const confirmed = body.confirmed === true;
         switch (action) {
           case '/details': reply(res, 200, { skill: await source.details(skillOf(body.skill)) }); break;
-          case '/install': reply(res, 200, { skill: await store.install(skillOf(body.skill), confirmed) }); break;
+          case '/install': {
+            const skill = await store.install(skillOf(body.skill), confirmed);
+            await publishSkillObservation(ctx, skill.directory);
+            reply(res, 200, { skill });
+            break;
+          }
           case '/check-updates': reply(res, 200, { updates: await store.checkUpdates() }); break;
-          case '/update': reply(res, 200, { skill: await store.update(idOf(body), confirmed) }); break;
-          case '/uninstall': await store.uninstall(idOf(body), confirmed); reply(res, 200, { ok: true }); break;
+          case '/update': {
+            const skill = await store.update(idOf(body), confirmed);
+            await publishSkillObservation(ctx, skill.directory);
+            reply(res, 200, { skill });
+            break;
+          }
+          case '/uninstall': {
+            const id = idOf(body);
+            const skill = (await store.list()).find(item => item.id === id);
+            await store.uninstall(id, confirmed);
+            if (skill) await publishSkillObservation(ctx, skill.directory);
+            reply(res, 200, { ok: true });
+            break;
+          }
         }
       } catch (error) {
         if (error instanceof SkillError) reply(res, error.status, { error: { code: error.code, message: error.message } });
